@@ -1,0 +1,202 @@
+// 运行配置（对应实施方案 §12 的 posture.yaml）
+//
+// 所有阈值都是「工程初始值」，不是人体工学规范；现场必须用
+// scripts/calibrate.sh + docs/calibration.md 的流程重新标定。
+#pragma once
+
+#include <string>
+
+namespace posture {
+
+struct Config {
+  static Config Defaults();
+  // 从 YAML 读取；缺省键用默认值补齐，文件不存在直接报错
+  static bool Load(const std::string& path, Config* out, std::string* err);
+  // 把实际生效的值序列化成可读文本（自检/审计用）
+  std::string Describe() const;
+
+  // ---- camera ----
+  std::string camera_device = "/dev/video0";
+  int camera_width = 640;
+  int camera_height = 480;
+  int capture_fps = 20;
+  int infer_fps = 8;
+  // NPU 核掩码：RK3576 只有 CORE_0/CORE_1 两个 NPU 核。
+  //   "auto"      = runtime 自己选（实测等价于单核）
+  //   "0" / "1"   = 绑定单核
+  //   "0_1"       = 双核并行（实测 yolov8n-pose 14.1ms -> 10.6ms，快 25%）
+  // 双核会吃满两个 NPU，若同一台板上还有别的 NPU 任务，改回 "auto"。
+  std::string npu_core_mask = "0_1";
+  std::string preferred_pixel_format = "MJPEG";
+  float camera_reconnect_backoff_s = 1.0f;
+
+  // 电动对焦 UVC 的焦距锁定。连续自动对焦会让镜头每帧微调，
+  // 画面持续轻微失焦（实测清晰度只有锁死时的 1/8），必须关掉。
+  // focus_absolute 的取值范围依设备而定（0..1023），用
+  //   bash scripts/focus.sh --scan
+  // 现场测出最佳值再填进来；-1 表示「不干预，保持设备默认」。
+  bool focus_autofocus = false;
+  int focus_absolute = -1;
+  // 曝光同理：自动曝光在人在/人走时会来回调，导致亮度跳变影响关键点。
+  // -1 表示不干预。
+  int exposure_time_absolute = -1;
+  float camera_reconnect_backoff_max_s = 15.0f;
+
+  // ---- models ----
+  std::string model_path = "/opt/posture-guard/models/yolov8n-pose.rknn";
+  float pose_confidence = 0.5f;
+  float joint_confidence = 0.5f;
+  float nms_iou = 0.45f;
+
+  // ---- user ----
+  float roi_x = 0.10f, roi_y = 0.05f, roi_w = 0.80f, roi_h = 0.90f;
+  float calibration_duration_s = 5.0f;
+  std::string baseline_file = "/var/lib/posture-guard/baseline.json";
+
+  // ---- posture（核心规则，对应 §4.2 / §4.3 / §12.2）----
+  float shoulder_trigger_deg = 12.0f;
+  float shoulder_recover_deg = 8.0f;
+  float shoulder_hold_s = 8.0f;
+  float recovery_hold_s = 3.0f;
+  float missing_data_timeout_s = 1.5f;
+
+  // 演示需求（DEMO-036）额外要求的三类姿态。实施方案把它们列为 V2
+  // （需要人脸 Landmark / ToF），这里用「肩宽归一化的近似量」实现，
+  // 界面与日志都会明确标注 approx，不当成真实角度。
+  // 「鼻子离肩线太近」的下限。俯视机位（摄像头装在显示器上方往下拍）会让
+  // 头肩纵向距离天然变小，人一低头更是直接压到肩线上 —— 这时不能判"几何不可用"，
+  // 那恰恰就是要检测的低头。所以这里只留一个极低的兜底门槛，
+  // 用来挡"模型把鼻子检到肩膀上"这种明显错误，而不是挡正常低头。
+  float min_head_gap = 0.08f;
+
+  // ---- 取景硬门（超出就拒绝判定，明确告诉用户「机位不对」）----
+  //
+  // 只保留两条真正的硬约束，都来自「哪些关键点必须可见」：
+  //   frame_max_top_over：头顶被裁 = 耳朵/眼睛出画面 → 歪头永远测不到。
+  //     这是必须拦的（实测人太近时超出 30%）。
+  //   frame_max_person_w：人太宽 = 双肩被裁 → 肩宽/肩线全失真。
+  //
+  // 故意**不设**「占画面高上限」：桌面机位常常只拍到头和肩，躯干在画面外，
+  // 人体框自然撑满 100% 高度 —— 这对本系统完全没问题（只需要头+肩）。
+  // 早期版本设了 0.90，结果把所有正常帧都拦住了。
+  float frame_max_top_over = 0.03f;
+  float frame_max_person_h = 1.50f;   // 实际不生效，留字段兼容
+  float frame_max_person_w = 0.90f;
+
+  // 低头阈值：相对「基准头肩距离」的比例。
+  //
+  // 为什么不能用固定绝对值：头肩纵向距离本身随摄像头俯仰角变化很大
+  // （直视机位基准约 -0.9 肩宽，显示器上方俯拍只有 -0.20）。固定的 0.35
+  // 在俯视机位下永远达不到（鼻子压到肩线上最多也就降 0.20），低头检测直接失效。
+  // 用比例就与机位无关：鼻子朝肩线下降了「自己基准距离的 55%」即判明显低头。
+  float head_down_drop_ratio = 0.25f;
+  float head_down_drop_min = 0.10f;  // 比例算出的阈值下限（防噪声）
+  float head_down_drop_max = 0.35f;  // 上限（防直视机位下过于迟钝）
+  float head_down_drop_legacy = 0.35f;   // 兼容旧配置键，仅在没有基准时参考
+  float head_down_hold_s = 5.0f;
+  float head_tilt_deg = 18.0f;       // 鼻-肩中点连线相对基准的偏角
+  float head_tilt_hold_s = 5.0f;
+  // 离屏过近：改为「相对校准基准的倍数」，与机位/FOV 无关。
+  // 绝对值（too_close_ratio）在不同摄像头 FOV 下完全不可比 ——
+  // 实测 icSpring 机位坐近是 0.78，UGREEN 俯视机位正常距离就已经 0.42。
+  // 用倍数：1.35 表示「比校准时近了 1/1.35 = 26%」。
+  float too_close_ratio_rel = 1.35f;
+  float too_close_ratio = 0.75f;     // 绝对值兜底（没有基准时用）
+  float too_close_hold_s = 5.0f;
+  // 托腮门控：手腕必须比「校准时的手腕高度」抬高多少肩宽。
+  // 不能用「手腕高于肩线」—— 俯拍机位下下巴/手腕投影都在肩线以下，
+  // 实测托腮时 wrist_y_rel=0.38（仍低于肩线 0.38），而正常坐 1.19。
+  // ★ 0.35 -> 0.20：教学样本实测真实托腮 rise 中位 0.340，旧值 0.35 恰好把它
+  //   卡在门外（22 帧里只过 9 帧），导致真实托腮召回 0.0。新值让 22/22 帧全过。
+  float hand_face_wrist_rise = 0.20f;
+  float hand_face_ratio = 0.95f;
+  // 托腮的「手确实贴着脸」上限：手腕-鼻子距离 / 肩宽 超过该值就不算托腮。
+  // 实测标定（板 2，2026-11-03）：
+  //   托腮 wrist_near 0.44~0.49   |   手离开脸 1.09   |   正常坐 1.05~1.74
+  // 取 0.85 = 两侧留足余量。
+  // ★ 只在「测量有效」时才用：wrist_near 的哨兵 99 表示「测不到」而不是
+  //   「很远」，那种帧必须放行，否则会把真托腮全挡掉。
+  float hand_face_near_max = 0.85f;
+
+  // 人体尺寸门：主用户的肩宽占比不得低于「校准基准 × 该比例」。
+  // 用来挡「人走了以后椅子/桌角被当成人体」—— 实测假阳性框只有 95x118px
+  // （宽占比 0.12），而正常坐着的用户是 0.35。同时也能挡掉这类小框
+  // 造成的「多人」误判。
+  float min_size_ratio = 0.55f;     // 手腕-鼻子距离 / 肩宽
+  // 手腕-鼻子距离 / 肩宽
+  // ★ 托腮保持门限单独给：这是把「抬手掠过」和「真托着」分开的唯一维度。
+  //   实测真实托腮持续 >=11s，误报持续 1~4s。
+  float hand_face_hold_s = 3.0f;
+
+  // ---- eye care（§5.1 / §5.2）----
+  float continuous_use_s = 1200.0f;
+  float far_look_s = 20.0f;
+  float presence_confirm_s = 2.0f;
+  float absent_confirm_s = 10.0f;
+  std::string reminder_policy = "manual_ack_or_session_reset";
+
+  // ---- notification（§13.1）----
+  float cooldown_s = 60.0f;
+  // 播报前的额外稳定门限（秒）。
+  // ★ 2.0 -> 0.5：姿势层已经用「时间窗投票」做了去抖（0.6s/80%），
+  //   这里再等 2 秒等于重复去抖，纯加延迟。
+  //   实测延迟链：画像投票 0.6s + 本门限 2.0s = 2.6s（用户感知约 5 秒，
+  //   含人动作的生理起势时间）。降到 0.5s 后总门限约 1.1s。
+  int posture_reminder_frames = 10;  // >0: consecutive valid bad frames; 0: legacy time mode
+  double posture_reminder_hold_s = 0.5;
+  bool headless_log = true;
+  bool desktop_popup = false;
+  bool voice = false;
+
+  // ---- privacy（§18.2）----
+  bool save_raw_video = false;
+  bool save_face_images = false;
+  bool log_keypoints = false;
+  int retain_statistics_days = 30;
+
+  // ---- 界面视频流 ----
+  // 后台服务把采集画面编码成 JPEG 沿本地 unix socket 发给界面显示。
+  // 只在本机内存/本地 socket 里流转，不落盘、不出网（privacy 那几条仍强制为 false）。
+  // 关掉后界面只剩骨架（隐私更强的模式）。
+  bool ui_stream_video = true;
+  int ui_video_width = 640;      // 下采样宽度；0 = 原始宽度
+  int ui_video_fps = 10;         // 视频流帧率（与推理帧率无关）
+  int ui_jpeg_quality = 70;      // 1-100
+
+  // ---- runtime（本版新增，部署路径）----
+  // ---- 逐姿势校准画像 ----
+  // 存在就用画像分类（最近原型），不存在就退回阈值规则。
+  std::string profile_file = "/var/lib/posture-guard/postures.txt";
+  double profile_hold_s = 2.0;         // 同一标签连续多久才采纳
+  // 逐类覆盖（0 = 用 profile_hold_s）。
+  // 为什么需要：各类误报的代价不同 —— 托腮误报最让人反感（抬手拿水杯就报），
+  // 而且要「真的托着」才有意义；实测评测里真实托腮持续 ≥11s，
+  // 误报只持续 1~4s，用保持门限是最干净的分离手段。
+  double profile_hold_hand_face_s = 0.0;
+  double profile_hold_head_tilt_s = 0.0;
+  double profile_hold_head_down_s = 0.0;
+  double profile_hold_too_close_s = 0.0;
+  // 托腮的「手在脸旁」门限（腕-耳中点 / 肩宽）。
+  // 判据是影像几何，不由 issue 校准得出，所以放配置而不是画像文件。
+  float hand_face_wrist_face_max = 0.95f;
+  // 托腮时手必须在耳朵以下（防止举手/摸头发/撑额头被判成托腮）。
+  // 定义性几何约束，不是参数校准。基准是耳中点（比鼻子稳）。
+  float hand_face_below_ear_min = 0.0f;
+  double profile_accept_radius = 3.0;  // 距离超过它判 UNKNOWN（不在已校准范围内）
+  // 画像级联的迟滞比例（相对 ReleaseScale）：0 = 关闭，0.5 = 默认。
+  // 作用见 PostureProfile::ClassifyHysteretic 的注释。
+  double profile_release_ratio = 0.5;
+  // 基准漂移阈值：宽占比差这么多倍就判基准失效、自动重校准。
+  // 之所以要收紧到 1.45：全部姿势特征都是「相对基准」的量，人一退椅子
+  // 就整体失配（实测校准 0.459、后来 0.305，差 1.5 倍，size 变成 0.66，
+  // 所有姿势都判不出来）。1.8 拦不住这种。
+  double baseline_drift_ratio = 1.45;
+  double baseline_drift_head_dy = 0.38;
+
+  std::string status_socket = "/run/posture-guard/status.sock";
+  std::string state_dir = "/var/lib/posture-guard";
+  std::string stats_dir = "/var/lib/posture-guard/stats";
+  bool calibrate_on_start = false;   // 首启无基准时自动进入校准
+};
+
+}  // namespace posture
